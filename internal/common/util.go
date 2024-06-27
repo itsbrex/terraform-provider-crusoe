@@ -23,12 +23,13 @@ const (
 	ErrorMsgProviderInitFailed = "Could not initialize the Crusoe provider." +
 		" Please check your Crusoe configuration and try again, and if the problem persists, contact support@crusoecloud.com."
 
-	latestVersionURL = "https://api.github.com/repos/crusoecloud/terraform-provider-crusoe/releases/latest"
-	colorGreen       = "\033[32m"
-	colorYellow      = "\033[33m"
-	colorRed         = "\033[31m"
-	colorReset       = "\033[0m"
-	metadataFile     = "/.crusoe/.metadata"
+	latestVersionURL   = "https://api.github.com/repos/crusoecloud/terraform-provider-crusoe/releases/latest"
+	colorGreen         = "\033[32m"
+	colorYellow        = "\033[33m"
+	colorRed           = "\033[31m"
+	colorReset         = "\033[0m"
+	metadataFile       = "/.crusoe/.metadata"
+	DevelopmentMessage = "This feature is currently in development. Reach out to support@crusoecloud.com with any questions."
 )
 
 var version string
@@ -70,7 +71,7 @@ func NewAPIClient(host, key, secret string) *swagger.APIClient {
 	cfg.UserAgent = fmt.Sprintf("CrusoeTerraform/%s", version)
 	cfg.BasePath = host
 	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = http.DefaultClient
+		cfg.HTTPClient = buildRetryClient().StandardClient()
 	}
 
 	cfg.HTTPClient.Transport = NewAuthenticatingTransport(cfg.HTTPClient.Transport, key, secret)

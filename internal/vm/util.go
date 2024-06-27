@@ -134,15 +134,17 @@ func vmNetworkInterfacesToTerraformDataModel(networkInterfaces []swagger.Network
 }
 
 // vmNetworkInterfacesToTerraformResourceModel creates a slice of Terraform-compatible network
-// interface resource instances from Crusoe API network interfaces.
-func vmNetworkInterfacesToTerraformResourceModel(networkInterfaces []swagger.NetworkInterface) (networkInterfacesList types.List, warning string) {
+// interface resource instances from Crusoe API network interfaces. If a plan is provided, we want to ensure that
+// the ordering of interfaces in the plan is maintained.
+func vmNetworkInterfacesToTerraformResourceModel(networkInterfaces []swagger.NetworkInterface) (networkInterfacesList types.List, warning diag.Diagnostics) {
 	interfaces := make([]vmNetworkInterfaceResourceModel, 0, len(networkInterfaces))
 	for _, networkInterface := range networkInterfaces {
 		var publicIP swagger.PublicIpv4Address
 		var privateIP swagger.PrivateIpv4Address
 		if len(networkInterface.Ips) == 0 {
-			warning = "At least one network interface is missing IP addresses. Please reach out to support@crusoecloud.com" +
-				" and let us know."
+			warning.AddWarning("Unexpected state when unmarshaling network interfaces for Instance",
+				"At least one network interface is missing IP addresses. Please reach out to "+
+					"support@crusoecloud.com and let us know.")
 		} else {
 			publicIP = *networkInterface.Ips[0].PublicIpv4
 			privateIP = *networkInterface.Ips[0].PrivateIpv4
@@ -166,7 +168,8 @@ func vmNetworkInterfacesToTerraformResourceModel(networkInterfaces []swagger.Net
 		})
 	}
 
-	values, _ := types.ListValueFrom(context.Background(), vmNetworkInterfaceSchema, interfaces)
+	values, diags := types.ListValueFrom(context.Background(), vmNetworkInterfaceSchema, interfaces)
+	warning.Append(diags...)
 
 	return values, warning
 }
@@ -227,6 +230,7 @@ func findInstance(ctx context.Context, client *swagger.APIClient, instanceID str
 	return nil, errProjectNotFound
 }
 
+// use for empty state pointer
 func vmToTerraformResourceModel(instance *swagger.InstanceV1Alpha5, state *vmResourceModel) {
 	state.ID = types.StringValue(instance.Id)
 	state.Name = types.StringValue(instance.Name)
@@ -236,6 +240,7 @@ func vmToTerraformResourceModel(instance *swagger.InstanceV1Alpha5, state *vmRes
 	state.Location = types.StringValue(instance.Location)
 	networkInterfaces, _ := vmNetworkInterfacesToTerraformResourceModel(instance.NetworkInterfaces)
 	state.NetworkInterfaces = networkInterfaces
+	state.ReservationID = types.StringValue(instance.ReservationId)
 
 	disks := make([]vmDiskResourceModel, 0, len(instance.Disks))
 	for i := range instance.Disks {
@@ -248,6 +253,65 @@ func vmToTerraformResourceModel(instance *swagger.InstanceV1Alpha5, state *vmRes
 			})
 		}
 	}
+
+	if len(disks) > 0 {
+		tDisks, _ := types.ListValueFrom(context.Background(), vmDiskAttachmentSchema, disks)
+		state.Disks = tDisks
+	} else {
+		state.Disks = types.ListNull(vmDiskAttachmentSchema)
+	}
+
+	if len(instance.HostChannelAdapters) > 0 {
+		state.HostChannelAdapters = vmHostChannelAdaptersToTerraformResourceModel(instance.HostChannelAdapters)
+	} else {
+		state.HostChannelAdapters = types.ListNull(vmHostChannelAdapterSchema)
+	}
+}
+
+func vmUpdateTerraformState(instance *swagger.InstanceV1Alpha5, state *vmResourceModel) {
+	state.ID = types.StringValue(instance.Id)
+	state.Name = types.StringValue(instance.Name)
+	state.Type = types.StringValue(instance.Type_)
+	state.ProjectID = types.StringValue(instance.ProjectId)
+	state.FQDN = types.StringValue(fmt.Sprintf("%s.%s.compute.internal", instance.Name, instance.Location))
+	state.Location = types.StringValue(instance.Location)
+	networkInterfaces, _ := vmNetworkInterfacesToTerraformResourceModel(instance.NetworkInterfaces)
+	state.NetworkInterfaces = networkInterfaces
+	state.ReservationID = types.StringValue(instance.ReservationId)
+
+	remoteDisksMap := make(map[string]vmDiskResourceModel)
+	for i := range instance.Disks {
+		disk := instance.Disks[i]
+		if disk.AttachmentType != DiskOS {
+			remoteDisksMap[disk.Id] = vmDiskResourceModel{
+				ID:             disk.Id,
+				AttachmentType: disk.AttachmentType,
+				Mode:           disk.Mode,
+			}
+		}
+	}
+
+	var stateDisks []vmDiskResourceModel
+	state.Disks.ElementsAs(context.Background(), &stateDisks, false)
+
+	disks := make([]vmDiskResourceModel, 0, len(instance.Disks))
+	for j := range stateDisks {
+		currDisk := stateDisks[j]
+		newDisk, ok := remoteDisksMap[currDisk.ID]
+		// old disk is no longer attached
+		if !ok {
+			continue
+		} else {
+			// append the disk to be returned
+			disks = append(disks, newDisk)
+			delete(remoteDisksMap, newDisk.ID)
+		}
+	}
+
+	for _, remainingDisk := range remoteDisksMap {
+		disks = append(disks, remainingDisk)
+	}
+
 	if len(disks) > 0 {
 		tDisks, _ := types.ListValueFrom(context.Background(), vmDiskAttachmentSchema, disks)
 		state.Disks = tDisks
