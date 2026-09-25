@@ -11,6 +11,18 @@ const (
 	configFilePath = "/.crusoe/config" // full path is this appended to the user's home path
 
 	defaultApiEndpoint = "https://api.cloud.crusoe.ai/v1"
+
+	// defaultServiceAccountTokenURL is Crusoe's Hydra OAuth2 token endpoint for the
+	// client_credentials grant. Overridable via service_account_token_url /
+	// CRUSOE_SERVICE_ACCOUNT_TOKEN_URL.
+	defaultServiceAccountTokenURL = "https://auth.crusoe.ai/oauth2/token" //nolint:gosec // G101: URL constant, not a credential
+
+	// defaultServiceAccountAudience is the "audience" requested alongside every service account
+	// token. Hydra treats the registered audience as an allowlist, not something it stamps onto
+	// the token automatically, so this must be sent explicitly or the token's aud claim comes
+	// back empty and the API rejects it. Overridable via service_account_audience /
+	// CRUSOE_SERVICE_ACCOUNT_AUDIENCE.
+	defaultServiceAccountAudience = "https://api.crusoe.ai"
 )
 
 // Config holds options that can be set via ~/.crusoe/config and env variables.
@@ -21,6 +33,19 @@ type Config struct {
 	SSHPublicKeyFile string `toml:"ssh_public_key_file"`
 	ApiEndpoint      string `toml:"api_endpoint"`
 	DefaultProject   string `toml:"default_project"`
+
+	// ServiceAccountClientID and ServiceAccountClientSecret authenticate via OAuth2
+	// client_credentials, as an alternative to AccessKeyID/SecretKey. See ResolveAuthMethod.
+	ServiceAccountClientID     string `toml:"service_account_client_id"`
+	ServiceAccountClientSecret string `toml:"service_account_client_secret"`
+
+	// ServiceAccountTokenURL is the OAuth2 token endpoint for the client_credentials exchange.
+	// Defaults to Crusoe's production Hydra endpoint.
+	ServiceAccountTokenURL string `toml:"service_account_token_url"`
+
+	// ServiceAccountAudience is the "audience" requested on the token request. Defaults to
+	// prod's audience; must match the target environment's auth-gateway.
+	ServiceAccountAudience string `toml:"service_account_audience"`
 }
 
 // ConfigOptions allows overriding config defaults from the provider block.
@@ -62,6 +87,9 @@ func GetConfig() (*Config, error) {
 // GetConfigWithOptions populates a config struct based on default values, the user's Crusoe config file,
 // provider options, and environment variables. The config file used is ~/.crusoe/config.
 //
+// The returned *Config is always non-nil, even on error: a non-nil error only means the config
+// file couldn't be located or read, and callers should treat it as advisory, not fatal.
+//
 // Precedence for profile selection (highest to lowest):
 //  1. opts.Profile (from provider block)
 //  2. CRUSOE_PROFILE environment variable
@@ -74,21 +102,31 @@ func GetConfig() (*Config, error) {
 //  3. default_project from selected profile
 func GetConfigWithOptions(opts ConfigOptions) (*Config, error) {
 	config := Config{
-		ApiEndpoint: defaultApiEndpoint,
+		ApiEndpoint:            defaultApiEndpoint,
+		ServiceAccountTokenURL: defaultServiceAccountTokenURL,
+		ServiceAccountAudience: defaultServiceAccountAudience,
 	}
 
+	// A home-dir lookup failure falls through like a missing config file - env vars alone are a
+	// valid way to configure the provider. homeDirErr is still returned so the caller can warn.
+	var homeDirErr error
 	configPath := opts.ConfigPath
 	if configPath == "" {
 		homeDir, err := os.UserHomeDir()
 		if err != nil {
-			return nil, fmt.Errorf("failed to find home dir: %w", err)
+			homeDirErr = fmt.Errorf("failed to find home dir: %w", err)
+		} else {
+			configPath = homeDir + configFilePath
 		}
-		configPath = homeDir + configFilePath
 	}
 
 	var rawData map[string]interface{}
 	// Missing config/invalid config file is valid - credentials can come from env vars
-	if _, err := toml.DecodeFile(configPath, &rawData); err != nil {
+	if homeDirErr != nil {
+		fmt.Fprintf(os.Stderr, "Warning: %v\n", homeDirErr)
+		fmt.Fprintf(os.Stderr, "Continuing with environment variables only.\n")
+		rawData = make(map[string]interface{})
+	} else if _, err := toml.DecodeFile(configPath, &rawData); err != nil {
 		if os.IsNotExist(err) {
 			fmt.Fprintf(os.Stderr, "Info: config file not found at %s\n", configPath)
 			fmt.Fprintf(os.Stderr, "Using environment variables only.\n")
@@ -128,6 +166,18 @@ func GetConfigWithOptions(opts ConfigOptions) (*Config, error) {
 		if defaultProject, ok := valMap["default_project"].(string); ok {
 			profileConfig.DefaultProject = defaultProject
 		}
+		if clientID, ok := valMap["service_account_client_id"].(string); ok {
+			profileConfig.ServiceAccountClientID = clientID
+		}
+		if clientSecret, ok := valMap["service_account_client_secret"].(string); ok {
+			profileConfig.ServiceAccountClientSecret = clientSecret
+		}
+		if tokenURL, ok := valMap["service_account_token_url"].(string); ok {
+			profileConfig.ServiceAccountTokenURL = tokenURL
+		}
+		if audience, ok := valMap["service_account_audience"].(string); ok {
+			profileConfig.ServiceAccountAudience = audience
+		}
 		profilesMap[key] = profileConfig
 	}
 
@@ -161,6 +211,18 @@ func GetConfigWithOptions(opts ConfigOptions) (*Config, error) {
 		if profileConfig.ApiEndpoint != "" {
 			config.ApiEndpoint = profileConfig.ApiEndpoint
 		}
+		if profileConfig.ServiceAccountClientID != "" {
+			config.ServiceAccountClientID = profileConfig.ServiceAccountClientID
+		}
+		if profileConfig.ServiceAccountClientSecret != "" {
+			config.ServiceAccountClientSecret = profileConfig.ServiceAccountClientSecret
+		}
+		if profileConfig.ServiceAccountTokenURL != "" {
+			config.ServiceAccountTokenURL = profileConfig.ServiceAccountTokenURL
+		}
+		if profileConfig.ServiceAccountAudience != "" {
+			config.ServiceAccountAudience = profileConfig.ServiceAccountAudience
+		}
 	}
 
 	// Environment variables for credentials and API endpoint (always override profile)
@@ -172,6 +234,18 @@ func GetConfigWithOptions(opts ConfigOptions) (*Config, error) {
 	}
 	if apiEndpoint := os.Getenv("CRUSOE_API_ENDPOINT"); apiEndpoint != "" {
 		config.ApiEndpoint = apiEndpoint
+	}
+	if clientID := os.Getenv("CRUSOE_SERVICE_ACCOUNT_CLIENT_ID"); clientID != "" {
+		config.ServiceAccountClientID = clientID
+	}
+	if clientSecret := os.Getenv("CRUSOE_SERVICE_ACCOUNT_CLIENT_SECRET"); clientSecret != "" {
+		config.ServiceAccountClientSecret = clientSecret
+	}
+	if tokenURL := os.Getenv("CRUSOE_SERVICE_ACCOUNT_TOKEN_URL"); tokenURL != "" {
+		config.ServiceAccountTokenURL = tokenURL
+	}
+	if audience := os.Getenv("CRUSOE_SERVICE_ACCOUNT_AUDIENCE"); audience != "" {
+		config.ServiceAccountAudience = audience
 	}
 
 	if newEndpoint := migrateEndpoint(config.ApiEndpoint); newEndpoint != "" {
@@ -187,5 +261,5 @@ func GetConfigWithOptions(opts ConfigOptions) (*Config, error) {
 		config.DefaultProject = opts.Project
 	}
 
-	return &config, nil
+	return &config, homeDirErr
 }

@@ -7,7 +7,7 @@ toolchain go1.23.8
 require (
 	github.com/BurntSushi/toml v1.5.0
 	github.com/antihax/optional v1.0.0
-	github.com/crusoecloud/client-go v1.0.14
+	github.com/crusoecloud/client-go v1.0.17
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/go-retryablehttp v0.7.7
 	github.com/hashicorp/terraform-plugin-docs v0.21.0
@@ -93,7 +93,7 @@ require (
 	github.com/oklog/run v1.0.0 // indirect
 	golang.org/x/crypto v0.37.0
 	golang.org/x/net v0.39.0 // indirect
-	golang.org/x/oauth2 v0.26.0 // indirect
+	golang.org/x/oauth2 v0.26.0
 	golang.org/x/sys v0.32.0 // indirect
 	golang.org/x/text v0.24.0 // indirect
 	google.golang.org/genproto v0.0.0-20230410155749-daa745c078e1 // indirect

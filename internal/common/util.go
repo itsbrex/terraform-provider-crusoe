@@ -19,7 +19,9 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	tfResource "github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"golang.org/x/oauth2"
 
+	authv1 "github.com/crusoecloud/client-go/auth/v1"
 	swagger "github.com/crusoecloud/client-go/swagger/v1"
 )
 
@@ -29,12 +31,16 @@ const (
 	ErrorMsgProviderInitFailed = "Could not initialize the Crusoe provider." +
 		" Please check your Crusoe configuration and try again, and if the problem persists, contact support@crusoecloud.com."
 
-	latestVersionURL          = "https://api.github.com/repos/crusoecloud/terraform-provider-crusoe/releases/latest"
-	colorGreen                = "\033[32m"
-	colorYellow               = "\033[33m"
-	colorRed                  = "\033[31m"
-	colorReset                = "\033[0m"
-	metadataFile              = "/.crusoe/.metadata"
+	latestVersionURL = "https://api.github.com/repos/crusoecloud/terraform-provider-crusoe/releases/latest"
+	colorGreen       = "\033[32m"
+	colorYellow      = "\033[33m"
+	colorRed         = "\033[31m"
+	colorReset       = "\033[0m"
+	metadataFile     = "/.crusoe/.metadata"
+
+	// serviceAccountHTTPTimeout bounds requests made through ctxWithRetryTransport's client,
+	// since injecting our own HTTP client pre-empts client-go's default timeout.
+	serviceAccountHTTPTimeout = 30 * time.Second
 	DevelopmentSupportMessage = "Reach out to support@crusoecloud.com with any questions."
 	DevelopmentMessage        = "This feature is currently in development. " + DevelopmentSupportMessage
 	onlyUserReadPerms         = 0o600
@@ -90,6 +96,39 @@ func NewAPIClient(host, key, secret string) *swagger.APIClient {
 	cfg.HTTPClient.Transport = NewAuthenticatingTransport(cfg.HTTPClient.Transport, key, secret)
 
 	return swagger.NewAPIClient(cfg)
+}
+
+// ctxWithRetryTransport installs NewAPIClient's retry transport (429/5xx backoff, no retry on
+// POST) as the oauth2.HTTPClient value client-go's NewServiceAccountConfig reads, so it backs
+// both the token fetch and every outer API request.
+//
+// A ctx that already carries an oauth2.HTTPClient value is left untouched.
+func ctxWithRetryTransport(ctx context.Context) context.Context {
+	if ctx.Value(oauth2.HTTPClient) != nil {
+		return ctx
+	}
+
+	return context.WithValue(ctx, oauth2.HTTPClient, &http.Client{
+		Transport: buildRetryClient().StandardClient().Transport,
+		Timeout:   serviceAccountHTTPTimeout,
+	})
+}
+
+// NewServiceAccountAPIClient builds a Crusoe API client authenticated via OAuth2
+// client_credentials against tokenURL, requesting audience on every token. Token fetch/refresh
+// is automatic via client-go's auth/v1 transport; both it and every API request go through
+// ctxWithRetryTransport's retry transport, bounded by serviceAccountHTTPTimeout.
+func NewServiceAccountAPIClient(ctx context.Context, host, clientID, clientSecret, tokenURL, audience string) (
+	*swagger.APIClient, error,
+) {
+	cfg, err := authv1.NewServiceAccountConfig(ctxWithRetryTransport(ctx), clientID, clientSecret, tokenURL, audience)
+	if err != nil {
+		return nil, fmt.Errorf("building service-account API client: %w", err)
+	}
+	cfg.UserAgent = fmt.Sprintf("CrusoeTerraform/%s", version)
+	cfg.BasePath = host
+
+	return swagger.NewAPIClient(cfg), nil
 }
 
 // AwaitOperation polls an async API operation until it resolves into a success or failure state.
@@ -212,7 +251,6 @@ func opResultToError(res interface{}) (expectedErr, unexpectedErr error) {
 }
 
 // errorBody mirrors swagger.ErrorBody, which the generated client no longer exposes.
-// TODO: CCX-5707 - drop and revert to swagger.ErrorBody once the SDK exposes it again.
 type errorBody struct {
 	Code    string `json:"code,omitempty"`
 	ErrorId string `json:"error_id,omitempty"`
@@ -500,19 +538,12 @@ func StringMapToTFMap(m map[string]string) (types.Map, diag.Diagnostics) {
 
 // FormatDeprecation builds the deprecation notice for a field.
 //
-// Put this text in an attribute's DeprecationMessage only when the practitioner can act on
-// it, which means an attribute they write: Required, Optional, or Optional+Computed. For a
-// Computed-only attribute, pass it as the Description instead. Two reasons:
+// Use it in DeprecationMessage only for a practitioner-writable attribute (Required, Optional,
+// or Optional+Computed); for Computed-only, put it in Description instead. A deprecation warning
+// propagates to every reference to the containing object, and the text asks the reader to
+// remove a field from their config - neither applies to a field they never write.
 //
-//  1. Terraform propagates an attribute deprecation to every reference to a containing
-//     object, so a warning fires for someone who passes a whole data source item or
-//     resource to an output and never touches the deprecated attribute. There is no way to
-//     silence it short of projecting individual fields.
-//  2. The text asks the reader to remove the field from their configuration, which a
-//     read-only attribute was never in.
-//
-// A whole resource or data source is a different case, and its schema-level
-// DeprecationMessage is correct: choosing to use it is the actionable thing. See
+// For a whole resource/data source, use its schema-level DeprecationMessage instead; see
 // FormatResourceDeprecationWithReplacement.
 func FormatDeprecation(deprecatedInVersion string) string {
 	return fmt.Sprintf("This field is deprecated as of provider version %s "+

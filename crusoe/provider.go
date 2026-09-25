@@ -2,6 +2,7 @@ package crusoe
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -161,6 +162,7 @@ func (p *crusoeProvider) Configure(ctx context.Context, req provider.ConfigureRe
 		Project: config.Project.ValueString(),
 	}
 
+	// clientConfig is always non-nil, even when err is set (see GetConfigWithOptions).
 	clientConfig, err := common.GetConfigWithOptions(opts)
 	if err != nil {
 		// only show a warning, since it's possible that we can't read their home dir (which is unexpected) but
@@ -170,33 +172,78 @@ func (p *crusoeProvider) Configure(ctx context.Context, req provider.ConfigureRe
 				" read your home directory.\n\nWarning: %s", err.Error()))
 	}
 
-	if clientConfig.AccessKeyID == "" {
-		resp.Diagnostics.AddAttributeError(
-			path.Root("profile"),
-			"Missing Crusoe API Key",
-			"The provider cannot create the Crusoe API client as there is a missing or empty value for the Crusoe API key. "+
-				"Set the value in ~/.crusoe/config, use the CRUSOE_ACCESS_KEY_ID environment variable, "+
-				"or specify a profile in the provider block. If already set, ensure the value is not empty.",
-		)
-	}
+	// Determine which authentication method (API key or service account) is configured; see
+	// common.ResolveAuthMethod for validation rules.
+	authMethod, authErr := common.ResolveAuthMethod(clientConfig)
+	if authErr != nil {
+		switch {
+		case errors.Is(authErr, common.ErrConflictingCredentials):
+			resp.Diagnostics.AddAttributeError(
+				path.Root("profile"),
+				"Conflicting Crusoe Credentials",
+				"Both an API key (access_key_id/secret_key) and service account credentials "+
+					"(service_account_client_id/service_account_client_secret) are configured. The provider "+
+					"cannot determine which identity to authenticate as, and will not silently pick one. "+
+					"Unset one credential pair in ~/.crusoe/config or the corresponding CRUSOE_* environment variables.",
+			)
+		case errors.Is(authErr, common.ErrIncompleteAPIKeyCredentials):
+			resp.Diagnostics.AddAttributeError(
+				path.Root("profile"),
+				"Incomplete Crusoe API Key",
+				"Only one of access_key_id/secret_key is set; both are required together. "+
+					"Set both values in ~/.crusoe/config, via the CRUSOE_ACCESS_KEY_ID/CRUSOE_SECRET_KEY environment "+
+					"variables, or specify a profile in the provider block.",
+			)
+		case errors.Is(authErr, common.ErrIncompleteServiceAccountCredentials):
+			resp.Diagnostics.AddAttributeError(
+				path.Root("profile"),
+				"Incomplete Crusoe Service Account Credentials",
+				"Only one of service_account_client_id/service_account_client_secret is set; both are required "+
+					"together. Set both values in ~/.crusoe/config, via the CRUSOE_SERVICE_ACCOUNT_CLIENT_ID/"+
+					"CRUSOE_SERVICE_ACCOUNT_CLIENT_SECRET environment variables, or specify a profile in the provider block.",
+			)
+		default: // common.ErrMissingCredentials
+			resp.Diagnostics.AddAttributeError(
+				path.Root("profile"),
+				"Missing Crusoe Credentials",
+				"The provider cannot create the Crusoe API client because no credentials were found. Configure one "+
+					"of the following in ~/.crusoe/config (optionally under a profile), or via environment variables:\n\n"+
+					"  - API key: access_key_id + secret_key (or CRUSOE_ACCESS_KEY_ID + CRUSOE_SECRET_KEY)\n"+
+					"  - Service account: service_account_client_id + service_account_client_secret "+
+					"(or CRUSOE_SERVICE_ACCOUNT_CLIENT_ID + CRUSOE_SERVICE_ACCOUNT_CLIENT_SECRET)\n\n"+
+					"You can also specify a profile in the provider block. If already set, ensure the values are not empty.",
+			)
+		}
 
-	if clientConfig.SecretKey == "" {
-		resp.Diagnostics.AddAttributeError(
-			path.Root("profile"),
-			"Missing Crusoe API Secret",
-			"The provider cannot create the Crusoe API client as there is a missing or empty value for the Crusoe API secret. "+
-				"Set the value in ~/.crusoe/config, use the CRUSOE_SECRET_KEY environment variable, "+
-				"or specify a profile in the provider block. If already set, ensure the value is not empty.",
-		)
-	}
-
-	// Exit if there are missing required attributes
-	if resp.Diagnostics.HasError() {
 		return
 	}
 
 	// Create an API client and make it available during DataSource and Resource type Configure methods.
-	apiClient := common.NewAPIClient(clientConfig.ApiEndpoint, clientConfig.AccessKeyID, clientConfig.SecretKey)
+	var apiClient *swagger.APIClient
+	if authMethod == common.AuthMethodServiceAccount {
+		// context.Background(), not ctx: the token source reuses whatever context it's built
+		// with for every future refresh, but ctx is cancelled once Configure returns while
+		// apiClient outlives it.
+		apiClient, err = common.NewServiceAccountAPIClient(
+			context.Background(),
+			clientConfig.ApiEndpoint,
+			clientConfig.ServiceAccountClientID,
+			clientConfig.ServiceAccountClientSecret,
+			clientConfig.ServiceAccountTokenURL,
+			clientConfig.ServiceAccountAudience,
+		)
+		if err != nil {
+			resp.Diagnostics.AddAttributeError(
+				path.Root("profile"),
+				"Failed to Initialize Service Account Authentication",
+				err.Error(),
+			)
+
+			return
+		}
+	} else {
+		apiClient = common.NewAPIClient(clientConfig.ApiEndpoint, clientConfig.AccessKeyID, clientConfig.SecretKey)
+	}
 
 	var projectId string
 	var getError error
